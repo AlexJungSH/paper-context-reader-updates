@@ -1,0 +1,135 @@
+# D-CI-COST3 (2026-10-05): the Mac packages of BMH Paper Reader, built here because Actions are free on a public
+# repository (the private source repository bills macOS minutes ×10). The private source is checked out at one exact
+# commit with a read-only deploy key (secret SOURCE_DEPLOY_KEY); signing and notarisation secrets live in this
+# repository's secrets. Logs are public; secrets are masked. Only people with write access here can start a run.
+# Kept in sync from whatwhywhi/paper-context-reader: scripts/ci/public-macos.yml (published as .github/workflows/macos.yml).
+#   gh workflow run macos.yml --repo AlexJungSH/paper-context-reader-updates -f sha=<40-hex source commit>
+# The release script accepts a run only when its name carries the release commit and the manifest records it.
+name: macOS packages
+run-name: macOS packages ${{ inputs.sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Source commit of whatwhywhi/paper-context-reader (40 hex characters)
+        required: true
+
+concurrency:
+  group: macos-packages
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      PAPER_READER_SOURCE_REPOSITORY: whatwhywhi/paper-context-reader
+      PAPER_READER_SOURCE_SHA: ${{ inputs.sha }}
+    steps:
+      - name: Check the source commit id
+        run: '[[ "$PAPER_READER_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@v4
+        with:
+          repository: whatwhywhi/paper-context-reader
+          ref: ${{ inputs.sha }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Confirm the checked-out commit
+        run: test "$(git rev-parse HEAD)" = "$PAPER_READER_SOURCE_SHA"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.13.0
+          cache: npm
+      - name: Install dependencies for the native architecture
+        run: npm ci --include=optional
+      - name: Verify source and packaging contracts
+        run: |
+          npm run lint
+          node --test test/macos-packaging.test.mjs test/prepare-public-build.test.mjs
+      - name: Prepare native Node runtime and macOS icon
+        run: npm run prepare:mac
+      - name: Stage optional publisher configuration
+        env:
+          GOOGLE_DRIVE_OAUTH_JSON: ${{ secrets.MAC_GOOGLE_DRIVE_OAUTH_JSON }}
+          UPDATE_JSON: ${{ secrets.MAC_UPDATE_JSON }}
+        run: |
+          if [[ -n "$GOOGLE_DRIVE_OAUTH_JSON" ]]; then
+            printf '%s' "$GOOGLE_DRIVE_OAUTH_JSON" > build/google-drive-oauth.json
+          fi
+          if [[ -n "$UPDATE_JSON" ]]; then
+            printf '%s' "$UPDATE_JSON" > build/update.json
+          fi
+          node -e 'for (const file of ["build/google-drive-oauth.json", "build/update.json"]) JSON.parse(require("node:fs").readFileSync(file, "utf8"))'
+      - name: Stage optional App Store Connect API key
+        env:
+          MAC_APPLE_API_KEY_P8: ${{ secrets.MAC_APPLE_API_KEY_P8 }}
+        run: |
+          if [[ -n "$MAC_APPLE_API_KEY_P8" ]]; then
+            key_path="$RUNNER_TEMP/paper-reader-notary-key.p8"
+            printf '%s' "$MAC_APPLE_API_KEY_P8" > "$key_path"
+            chmod 600 "$key_path"
+            echo "APPLE_API_KEY=$key_path" >> "$GITHUB_ENV"
+          fi
+      - name: Stage optional Developer ID certificate and publisher identity
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+        run: node scripts/prepare-macos-signing.mjs
+      - name: Build DMG and ZIP
+        id: build_package
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_ID: ${{ secrets.MAC_APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.MAC_APPLE_API_ISSUER }}
+        run: npm run dist:mac -- --arch arm64
+      - name: Offline packaged-app smoke and feature QA
+        env:
+          PAPER_READER_OFFLINE: "1"
+        run: node scripts/qa/electron-mac.mjs --mode packaged --arch arm64
+      - name: Native local-translation setup and tiny-model worker smoke
+        if: ${{ !cancelled() && steps.build_package.outcome == 'success' }}
+        run: node scripts/qa/mac-local-translation-smoke.mjs
+      - name: Native login-terminal lifecycle smoke
+        if: ${{ !cancelled() && steps.build_package.outcome == 'success' }}
+        run: node scripts/qa/mac-login-terminal-smoke.mjs
+      - name: Verify code signature
+        if: ${{ !cancelled() && steps.build_package.outcome == 'success' }}
+        run: |
+          app_path="dist/mac-arm64/BMH Paper Reader.app"
+          version=$(node -p 'require("./package.json").version')
+          dmg_path="dist/Paper-Context-Reader-${version}-mac-arm64.dmg"
+          manifest_path="dist/release-manifest-mac-${version}-arm64.json"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          signed=$(node -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1])).signed === true) ' "$manifest_path")
+          if [[ "$signed" == "true" ]]; then
+            codesign --verify --strict --verbose=2 "$dmg_path"
+            xcrun stapler validate "$dmg_path"
+            spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg_path"
+          fi
+      - name: Upload macOS packages
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-context-reader-macos-arm64
+          path: |
+            dist/Paper-Context-Reader-*-mac-arm64.dmg
+            dist/Paper-Context-Reader-*-mac-arm64.dmg.blockmap
+            dist/Paper-Context-Reader-*-mac-arm64.zip
+            dist/Paper-Context-Reader-*-mac-arm64.zip.blockmap
+            dist/release-manifest-mac-*-arm64.json
+            dist/latest-mac.yml
+          if-no-files-found: warn
+          # D-CI-COST2: about 1 GB per build; the release script downloads it right after the run. One day is enough.
+          retention-days: 1
+      - name: Upload macOS QA evidence
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-context-reader-macos-arm64-qa
+          path: .artifacts/electron-mac
+          if-no-files-found: warn
+          retention-days: 3
